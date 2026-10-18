@@ -1,0 +1,81 @@
+# name: test/sql/index/art/issues/test_art_issue_27422.test
+# description: Test issue 27422: ART index scans must intersect the value sets of conjunctive IN/equality filters
+# group: [issues]
+
+statement ok
+CREATE TABLE t(c INTEGER);
+
+statement ok
+INSERT INTO t VALUES (1), (2);
+
+statement ok
+CREATE INDEX t_c ON t(c);
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+statement ok
+SET index_scan_max_count = 0;
+
+# conjunctive filters keep using the index scan
+query II
+EXPLAIN ANALYZE SELECT * FROM t WHERE c IN (1, 2) AND c = 1;
+----
+analyzed_plan	<REGEX>:.*Index Scan.*
+
+# issue repro: c = 1 intersects the IN list {2}; NULL never matches, so no row qualifies
+query I
+SELECT * FROM t WHERE c = 1 AND c IN (2, NULL);
+----
+
+# second issue repro: two IN lists intersect; NULL never matches
+query I
+SELECT * FROM t WHERE c IN (1, 5) AND c IN (2, NULL);
+----
+
+# an IN list containing only NULL disqualifies every value
+query I
+SELECT * FROM t WHERE c = 1 AND c IN (NULL);
+----
+
+# the value sets of conjunctive IN lists intersect
+query I
+SELECT * FROM t WHERE c IN (1, 2) AND c IN (2, 3) ORDER BY c;
+----
+2
+
+# three conjuncts: two IN lists and a range comparison
+query I
+SELECT * FROM t WHERE c IN (1, 2) AND c IN (2, 3) AND c > 1 ORDER BY c;
+----
+2
+
+# a range comparison still filters the values of a single IN list
+query I
+SELECT * FROM t WHERE c > 0 AND c IN (2, NULL) ORDER BY c;
+----
+2
+
+# contradictory conjuncts result in no rows
+query I
+SELECT * FROM t WHERE c = 1 AND c != 1;
+----
+
+# a value present in every conjunct still qualifies
+query I
+SELECT * FROM t WHERE c = 1 AND c IN (1, NULL);
+----
+1
+
+# a single IN list still scans all its values
+query I
+SELECT * FROM t WHERE c IN (1, 2) ORDER BY c;
+----
+1
+2
+
+# equality still scans its value
+query I
+SELECT * FROM t WHERE c = 2;
+----
+2

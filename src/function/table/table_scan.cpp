@@ -739,7 +739,7 @@ struct ComparisonCondition {
 	Value constant;
 };
 
-static bool CollectValuesAndComparisonsFromExpression(const Expression &expr, value_set_t &in_values,
+static bool CollectValuesAndComparisonsFromExpression(const Expression &expr, vector<value_set_t> &value_sets,
                                                       vector<ComparisonCondition> &comparisons) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR &&
 	    expr.GetExpressionType() == ExpressionType::COMPARE_IN) {
@@ -747,6 +747,7 @@ static bool CollectValuesAndComparisonsFromExpression(const Expression &expr, va
 		if (op.GetChildren().empty() || op.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
 			return false;
 		}
+		value_set_t in_values;
 		for (idx_t i = 1; i < op.GetChildren().size(); i++) {
 			if (op.GetChildren()[i]->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 				return false;
@@ -756,6 +757,7 @@ static bool CollectValuesAndComparisonsFromExpression(const Expression &expr, va
 				in_values.insert(value);
 			}
 		}
+		value_sets.push_back(std::move(in_values));
 		return true;
 	}
 	if (BoundComparisonExpression::IsComparison(expr)) {
@@ -776,7 +778,7 @@ static bool CollectValuesAndComparisonsFromExpression(const Expression &expr, va
 			return false;
 		}
 		if (comp.GetExpressionType() == ExpressionType::COMPARE_EQUAL) {
-			in_values.insert(val);
+			value_sets.push_back(value_set_t {val});
 		}
 		comparisons.push_back({comp.GetExpressionType(), std::move(val)});
 		return true;
@@ -785,7 +787,7 @@ static bool CollectValuesAndComparisonsFromExpression(const Expression &expr, va
 	    expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
 		auto &conj = expr.Cast<BoundConjunctionExpression>();
 		for (auto &child : conj.GetChildren()) {
-			if (!CollectValuesAndComparisonsFromExpression(*child, in_values, comparisons)) {
+			if (!CollectValuesAndComparisonsFromExpression(*child, value_sets, comparisons)) {
 				return false;
 			}
 		}
@@ -796,7 +798,7 @@ static bool CollectValuesAndComparisonsFromExpression(const Expression &expr, va
 		if (ExpressionFilter::IsRootOptionalExpression(func)) {
 			auto optional_child = ExpressionFilter::GetOptionalFilterChild(func);
 			return !optional_child ||
-			       CollectValuesAndComparisonsFromExpression(*optional_child, in_values, comparisons);
+			       CollectValuesAndComparisonsFromExpression(*optional_child, value_sets, comparisons);
 		}
 		if (TableFilterFunctions::IsTableFilterFunction(func.Function())) {
 			return true;
@@ -845,14 +847,32 @@ static bool ValueQualifies(const Value &value, const vector<ComparisonCondition>
 }
 
 static bool ExtractValuesFromExpression(const Expression &expr, const LogicalType &key_type, DataChunk &key_columns) {
-	value_set_t in_values;
+	vector<value_set_t> value_sets;
 	vector<ComparisonCondition> comparisons;
-	if (!CollectValuesAndComparisonsFromExpression(expr, in_values, comparisons) || in_values.empty()) {
+	if (!CollectValuesAndComparisonsFromExpression(expr, value_sets, comparisons) || value_sets.empty()) {
 		return false;
 	}
-	key_columns.Initialize(Allocator::DefaultAllocator(), {key_type}, in_values.size());
-	for (const auto &value : in_values) {
-		if (!ValueQualifies(value, comparisons)) {
+	// Each value set is a conjunct: a qualifying value must be a member of
+	// every set, so the scan values are the intersection of all value sets.
+	// Unioning them instead would silently broaden the scan, and the index
+	// scan does not re-check the column's filters (see #27422).
+	idx_t smallest_set_idx = 0;
+	for (idx_t i = 1; i < value_sets.size(); i++) {
+		if (value_sets[i].size() < value_sets[smallest_set_idx].size()) {
+			smallest_set_idx = i;
+		}
+	}
+	auto &smallest_set = value_sets[smallest_set_idx];
+	key_columns.Initialize(Allocator::DefaultAllocator(), {key_type}, smallest_set.size());
+	for (const auto &value : smallest_set) {
+		bool in_all_sets = true;
+		for (idx_t i = 0; i < value_sets.size(); i++) {
+			if (i != smallest_set_idx && !value_sets[i].count(value)) {
+				in_all_sets = false;
+				break;
+			}
+		}
+		if (!in_all_sets || !ValueQualifies(value, comparisons)) {
 			continue;
 		}
 		if (value.type() != key_type) {
